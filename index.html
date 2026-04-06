@@ -16,8 +16,8 @@
     <h2>HA Camera Snapshot</h2>
     <p>MQTT (test.mosquitto.org) 経由でスナップショットを受信</p>
 
-    <button onclick="startListening()">受信開始</button>
-    <button onclick="stopListening()">停止</button>
+    <button onclick="startStreaming()">配信開始</button>
+    <button onclick="stopStreaming()">停止</button>
 
     <div id="status">未接続</div>
     <img id="snapshot" src="" alt="waiting for snapshot...">
@@ -32,7 +32,7 @@
             el.scrollTop = el.scrollHeight;
         }
 
-        function startListening() {
+        function startStreaming() {
             document.getElementById('status').textContent = '接続中...';
             log('Connecting to test.mosquitto.org via WebSocket...');
 
@@ -40,9 +40,16 @@
 
             mqttClient.on('connect', () => {
                 log('Connected to public MQTT broker');
-                document.getElementById('status').textContent = '接続済み - スナップショット待機中';
                 mqttClient.subscribe('ha-test/ha/camera/snapshot');
-                log('Subscribed to ha-test/ha/camera/snapshot');
+
+                // HA側にスナップショット連続送信をリクエスト
+                mqttClient.publish('ha-test/cloud/camera/start', JSON.stringify({
+                    entity_id: 'camera.front_door_fluent',
+                    interval: 2,
+                    count: 30
+                }));
+                document.getElementById('status').textContent = '配信リクエスト送信済み';
+                log('Requested snapshot stream (30 frames, 2s interval)');
             });
 
             mqttClient.on('message', (topic, message) => {
@@ -51,9 +58,9 @@
                     const img = document.getElementById('snapshot');
                     img.src = 'data:' + payload.content_type + ';base64,' + payload.image_base64;
                     document.getElementById('status').textContent =
-                        'Frame ' + payload.frame + '/' + payload.total + ' received';
-                    log('Frame ' + payload.frame + '/' + payload.total +
-                        ' (' + Math.round(payload.image_base64.length * 3/4 / 1024) + ' KB)');
+                        'Frame ' + payload.frame + '/' + payload.total + ' - ' +
+                        Math.round(payload.image_base64.length * 3/4 / 1024) + ' KB';
+                    log('Frame ' + payload.frame + '/' + payload.total);
                 } catch (e) {
                     log('Error: ' + e.message);
                 }
@@ -63,15 +70,13 @@
                 log('MQTT error: ' + err.message);
                 document.getElementById('status').textContent = 'エラー: ' + err.message;
             });
-
-            mqttClient.on('close', () => {
-                log('MQTT disconnected');
-                document.getElementById('status').textContent = '切断';
-            });
         }
 
-        function stopListening() {
+        function stopStreaming() {
             if (mqttClient) {
+                mqttClient.publish('ha-test/cloud/camera/stop', JSON.stringify({
+                    entity_id: 'camera.front_door_fluent'
+                }));
                 mqttClient.end();
                 mqttClient = null;
             }
