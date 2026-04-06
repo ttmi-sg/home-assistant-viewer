@@ -2,29 +2,36 @@
 <html>
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HA Snapshot Viewer</title>
-    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <title>HA Camera Viewer</title>
     <style>
         body { font-family: sans-serif; margin: 10px; background: #1a1a1a; color: #fff; text-align: center; }
-        img { max-width: 100%; border: 1px solid #333; }
+        video { width: 100%; max-width: 640px; background: #000; border: 1px solid #333; }
+        input { padding: 8px; margin: 5px; font-size: 14px; width: 90%; max-width: 400px; }
         button { padding: 15px 30px; margin: 10px; font-size: 18px; cursor: pointer; }
         #status { margin: 10px; font-size: 14px; color: #aaa; }
         #log { background: #111; padding: 10px; margin-top: 10px; font-family: monospace; font-size: 11px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; text-align: left; }
     </style>
 </head>
 <body>
-    <h2>HA Camera Snapshot</h2>
-    <p>MQTT (test.mosquitto.org) 経由でスナップショットを受信</p>
+    <h2>HA Camera Viewer</h2>
 
-    <button onclick="startStreaming()">配信開始</button>
-    <button onclick="stopStreaming()">停止</button>
+    <div>
+        <input id="haUrl" placeholder="HA URL (e.g. http://192.168.10.106:8123)" value="">
+        <input id="token" placeholder="Long-Lived Access Token" value="">
+        <input id="entityId" placeholder="Camera Entity ID" value="camera.front_door_fluent">
+        <br>
+        <button onclick="startViewing()">映像開始</button>
+        <button onclick="stopViewing()">停止</button>
+    </div>
 
     <div id="status">未接続</div>
-    <img id="snapshot" src="" alt="waiting for snapshot...">
+    <video id="video" autoplay playsinline muted></video>
     <div id="log"></div>
 
     <script>
-        let mqttClient = null;
+        let ws = null;
+        let pc = null;
+        let msgId = 1;
 
         function log(msg) {
             const el = document.getElementById('log');
@@ -32,54 +39,132 @@
             el.scrollTop = el.scrollHeight;
         }
 
-        function startStreaming() {
+        async function startViewing() {
+            const haUrl = document.getElementById('haUrl').value;
+            const token = document.getElementById('token').value;
+            const entityId = document.getElementById('entityId').value;
+
+            if (!haUrl || !token) {
+                log('HA URL and Token are required');
+                return;
+            }
+
+            const wsUrl = haUrl.replace('http', 'ws') + '/api/websocket';
+            log('Connecting to ' + wsUrl);
             document.getElementById('status').textContent = '接続中...';
-            log('Connecting to test.mosquitto.org via WebSocket...');
 
-            mqttClient = mqtt.connect('wss://test.mosquitto.org:8081');
+            ws = new WebSocket(wsUrl);
 
-            mqttClient.on('connect', () => {
-                log('Connected to public MQTT broker');
-                mqttClient.subscribe('ha-test/ha/camera/snapshot');
+            ws.onopen = () => log('WebSocket connected');
 
-                // HA側にスナップショット連続送信をリクエスト
-                mqttClient.publish('ha-test/cloud/camera/start', JSON.stringify({
-                    entity_id: 'camera.front_door_fluent',
-                    interval: 2,
-                    count: 30
-                }));
-                document.getElementById('status').textContent = '配信リクエスト送信済み';
-                log('Requested snapshot stream (30 frames, 2s interval)');
-            });
+            ws.onmessage = async (event) => {
+                const msg = JSON.parse(event.data);
 
-            mqttClient.on('message', (topic, message) => {
-                try {
-                    const payload = JSON.parse(message.toString());
-                    const img = document.getElementById('snapshot');
-                    img.src = 'data:' + payload.content_type + ';base64,' + payload.image_base64;
-                    document.getElementById('status').textContent =
-                        'Frame ' + payload.frame + '/' + payload.total + ' - ' +
-                        Math.round(payload.image_base64.length * 3/4 / 1024) + ' KB';
-                    log('Frame ' + payload.frame + '/' + payload.total);
-                } catch (e) {
-                    log('Error: ' + e.message);
+                if (msg.type === 'auth_required') {
+                    ws.send(JSON.stringify({ type: 'auth', access_token: token }));
+                    log('Auth sent');
                 }
-            });
 
-            mqttClient.on('error', (err) => {
-                log('MQTT error: ' + err.message);
-                document.getElementById('status').textContent = 'エラー: ' + err.message;
-            });
+                if (msg.type === 'auth_ok') {
+                    log('Auth OK - starting WebRTC');
+                    document.getElementById('status').textContent = '認証OK - WebRTC開始中';
+                    await startWebRTC(entityId);
+                }
+
+                if (msg.type === 'auth_invalid') {
+                    log('Auth FAILED');
+                    document.getElementById('status').textContent = '認証失敗';
+                }
+
+                if (msg.type === 'result' && msg.id === 1) {
+                    log('WebRTC offer sent: success=' + msg.success);
+                }
+
+                if (msg.type === 'event' && msg.id === 1) {
+                    const evt = msg.event;
+                    if (evt.type === 'answer') {
+                        log('SDP answer received (' + evt.answer.length + ' chars)');
+                        await pc.setRemoteDescription({ type: 'answer', sdp: evt.answer });
+                        log('Remote description set');
+                    }
+                    if (evt.type === 'candidate') {
+                        const c = evt.candidate;
+                        try {
+                            await pc.addIceCandidate({
+                                candidate: c.candidate,
+                                sdpMid: c.sdpMid || c.sdp_mid || '0',
+                                sdpMLineIndex: c.sdpMLineIndex || c.sdp_m_line_index || 0
+                            });
+                            log('ICE candidate added');
+                        } catch (e) {
+                            log('ICE candidate error: ' + e.message);
+                        }
+                    }
+                    if (evt.type === 'error') {
+                        log('Error: ' + evt.message);
+                    }
+                }
+            };
+
+            ws.onerror = (e) => log('WebSocket error');
+            ws.onclose = () => log('WebSocket closed');
         }
 
-        function stopStreaming() {
-            if (mqttClient) {
-                mqttClient.publish('ha-test/cloud/camera/stop', JSON.stringify({
-                    entity_id: 'camera.front_door_fluent'
-                }));
-                mqttClient.end();
-                mqttClient = null;
-            }
+        async function startWebRTC(entityId) {
+            pc = new RTCPeerConnection({
+                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+            });
+
+            pc.ontrack = (event) => {
+                log('Track received: ' + event.track.kind);
+                document.getElementById('video').srcObject = event.streams[0];
+                document.getElementById('status').textContent = '映像受信中';
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    log('Local ICE: ' + event.candidate.candidate.substr(0, 50) + '...');
+                    ws.send(JSON.stringify({
+                        id: 2,
+                        type: 'camera/webrtc/candidate',
+                        entity_id: entityId,
+                        session_id: pc._sessionId,
+                        candidate: {
+                            candidate: event.candidate.candidate,
+                            sdpMid: event.candidate.sdpMid,
+                            sdpMLineIndex: event.candidate.sdpMLineIndex
+                        }
+                    }));
+                }
+            };
+
+            pc.oniceconnectionstatechange = () => {
+                log('ICE state: ' + pc.iceConnectionState);
+                if (pc.iceConnectionState === 'connected') {
+                    document.getElementById('status').textContent = '映像接続完了';
+                }
+            };
+
+            pc.addTransceiver('video', { direction: 'recvonly' });
+            pc.addTransceiver('audio', { direction: 'recvonly' });
+
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            log('Sending SDP offer (' + offer.sdp.length + ' chars)');
+
+            ws.send(JSON.stringify({
+                id: 1,
+                type: 'camera/webrtc/offer',
+                entity_id: entityId,
+                offer: offer.sdp
+            }));
+        }
+
+        function stopViewing() {
+            if (pc) { pc.close(); pc = null; }
+            if (ws) { ws.close(); ws = null; }
+            document.getElementById('video').srcObject = null;
             document.getElementById('status').textContent = '停止';
             log('Stopped');
         }
