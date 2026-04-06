@@ -31,6 +31,7 @@
     <script>
         let ws = null;
         let pc = null;
+        let sessionId = null;
         let msgId = 1;
 
         function log(msg) {
@@ -54,38 +55,44 @@
             document.getElementById('status').textContent = '接続中...';
 
             ws = new WebSocket(wsUrl);
-
             ws.onopen = () => log('WebSocket connected');
+            ws.onerror = (e) => log('WebSocket error');
+            ws.onclose = () => log('WebSocket closed');
 
             ws.onmessage = async (event) => {
                 const msg = JSON.parse(event.data);
 
                 if (msg.type === 'auth_required') {
                     ws.send(JSON.stringify({ type: 'auth', access_token: token }));
-                    log('Auth sent');
                 }
 
                 if (msg.type === 'auth_ok') {
-                    log('Auth OK - starting WebRTC');
-                    document.getElementById('status').textContent = '認証OK - WebRTC開始中';
-                    await startWebRTC(entityId);
+                    log('Auth OK');
+                    // Step 1: get_client_config でICE設定を取得
+                    ws.send(JSON.stringify({
+                        id: msgId++,
+                        type: 'camera/webrtc/get_client_config',
+                        entity_id: entityId
+                    }));
                 }
 
-                if (msg.type === 'auth_invalid') {
-                    log('Auth FAILED');
-                    document.getElementById('status').textContent = '認証失敗';
+                if (msg.type === 'result' && msg.result && msg.result.configuration) {
+                    // Step 2: ICE設定を使ってPeerConnection作成
+                    const config = msg.result.configuration;
+                    log('ICE config: ' + JSON.stringify(config.iceServers));
+                    await startWebRTC(entityId, config);
                 }
 
-                if (msg.type === 'result' && msg.id === 1) {
-                    log('WebRTC offer sent: success=' + msg.success);
-                }
-
-                if (msg.type === 'event' && msg.id === 1) {
+                // WebRTC events (subscribeMessage style)
+                if (msg.type === 'event') {
                     const evt = msg.event;
+                    if (evt.type === 'session') {
+                        sessionId = evt.session_id;
+                        log('Session: ' + sessionId);
+                    }
                     if (evt.type === 'answer') {
-                        log('SDP answer received (' + evt.answer.length + ' chars)');
+                        log('SDP answer (' + evt.answer.length + ' chars)');
                         await pc.setRemoteDescription({ type: 'answer', sdp: evt.answer });
-                        log('Remote description set');
                     }
                     if (evt.type === 'candidate') {
                         const c = evt.candidate;
@@ -95,9 +102,9 @@
                                 sdpMid: c.sdpMid || c.sdp_mid || '0',
                                 sdpMLineIndex: c.sdpMLineIndex || c.sdp_m_line_index || 0
                             });
-                            log('ICE candidate added');
+                            log('Remote ICE added');
                         } catch (e) {
-                            log('ICE candidate error: ' + e.message);
+                            log('ICE error: ' + e.message);
                         }
                     }
                     if (evt.type === 'error') {
@@ -105,30 +112,24 @@
                     }
                 }
             };
-
-            ws.onerror = (e) => log('WebSocket error');
-            ws.onclose = () => log('WebSocket closed');
         }
 
-        async function startWebRTC(entityId) {
-            pc = new RTCPeerConnection({
-                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-            });
+        async function startWebRTC(entityId, config) {
+            pc = new RTCPeerConnection(config);
 
             pc.ontrack = (event) => {
-                log('Track received: ' + event.track.kind);
+                log('Track: ' + event.track.kind);
                 document.getElementById('video').srcObject = event.streams[0];
                 document.getElementById('status').textContent = '映像受信中';
             };
 
             pc.onicecandidate = (event) => {
-                if (event.candidate) {
-                    log('Local ICE: ' + event.candidate.candidate.substr(0, 50) + '...');
+                if (event.candidate && sessionId) {
                     ws.send(JSON.stringify({
-                        id: 2,
+                        id: msgId++,
                         type: 'camera/webrtc/candidate',
                         entity_id: entityId,
-                        session_id: pc._sessionId,
+                        session_id: sessionId,
                         candidate: {
                             candidate: event.candidate.candidate,
                             sdpMid: event.candidate.sdpMid,
@@ -139,10 +140,8 @@
             };
 
             pc.oniceconnectionstatechange = () => {
-                log('ICE state: ' + pc.iceConnectionState);
-                if (pc.iceConnectionState === 'connected') {
-                    document.getElementById('status').textContent = '映像接続完了';
-                }
+                log('ICE: ' + pc.iceConnectionState);
+                document.getElementById('status').textContent = 'ICE: ' + pc.iceConnectionState;
             };
 
             pc.addTransceiver('video', { direction: 'recvonly' });
@@ -151,14 +150,15 @@
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
 
-            log('Sending SDP offer (' + offer.sdp.length + ' chars)');
-
+            // subscribeMessage style: offerを送信し、eventでanswer/candidateを受信
+            const offerId = msgId++;
             ws.send(JSON.stringify({
-                id: 1,
+                id: offerId,
                 type: 'camera/webrtc/offer',
                 entity_id: entityId,
                 offer: offer.sdp
             }));
+            log('Offer sent (' + offer.sdp.length + ' chars)');
         }
 
         function stopViewing() {
