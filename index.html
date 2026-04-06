@@ -3,170 +3,60 @@
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HA Camera Viewer</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <style>
         body { font-family: sans-serif; margin: 10px; background: #1a1a1a; color: #fff; text-align: center; }
         video { width: 100%; max-width: 640px; background: #000; border: 1px solid #333; }
         input { padding: 8px; margin: 5px; font-size: 14px; width: 90%; max-width: 400px; }
         button { padding: 15px 30px; margin: 10px; font-size: 18px; cursor: pointer; }
         #status { margin: 10px; font-size: 14px; color: #aaa; }
-        #log { background: #111; padding: 10px; margin-top: 10px; font-family: monospace; font-size: 11px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; text-align: left; }
     </style>
 </head>
 <body>
     <h2>HA Camera Viewer</h2>
-
     <div>
-        <input id="haUrl" placeholder="HA URL (e.g. http://192.168.10.106:8123)" value="">
-        <input id="token" placeholder="Long-Lived Access Token" value="">
-        <input id="entityId" placeholder="Camera Entity ID" value="camera.front_door_fluent">
+        <input id="hlsUrl" placeholder="HLS URL" value="">
         <br>
-        <button onclick="startViewing()">映像開始</button>
-        <button onclick="stopViewing()">停止</button>
+        <button onclick="startPlay()">再生</button>
+        <button onclick="stopPlay()">停止</button>
     </div>
-
     <div id="status">未接続</div>
-    <video id="video" autoplay playsinline muted></video>
-    <div id="log"></div>
+    <video id="video" autoplay playsinline muted controls></video>
 
     <script>
-        let ws = null;
-        let pc = null;
-        let sessionId = null;
-        let msgId = 1;
+        let hls = null;
 
-        function log(msg) {
-            const el = document.getElementById('log');
-            el.textContent += new Date().toLocaleTimeString() + ' ' + msg + '\n';
-            el.scrollTop = el.scrollHeight;
-        }
+        function startPlay() {
+            const url = document.getElementById('hlsUrl').value;
+            if (!url) return;
 
-        async function startViewing() {
-            const haUrl = document.getElementById('haUrl').value;
-            const token = document.getElementById('token').value;
-            const entityId = document.getElementById('entityId').value;
-
-            if (!haUrl || !token) {
-                log('HA URL and Token are required');
-                return;
-            }
-
-            const wsUrl = haUrl.replace('http', 'ws') + '/api/websocket';
-            log('Connecting to ' + wsUrl);
+            const video = document.getElementById('video');
             document.getElementById('status').textContent = '接続中...';
 
-            ws = new WebSocket(wsUrl);
-            ws.onopen = () => log('WebSocket connected');
-            ws.onerror = (e) => log('WebSocket error');
-            ws.onclose = () => log('WebSocket closed');
-
-            ws.onmessage = async (event) => {
-                const msg = JSON.parse(event.data);
-
-                if (msg.type === 'auth_required') {
-                    ws.send(JSON.stringify({ type: 'auth', access_token: token }));
-                }
-
-                if (msg.type === 'auth_ok') {
-                    log('Auth OK');
-                    // Step 1: get_client_config でICE設定を取得
-                    ws.send(JSON.stringify({
-                        id: msgId++,
-                        type: 'camera/webrtc/get_client_config',
-                        entity_id: entityId
-                    }));
-                }
-
-                if (msg.type === 'result' && msg.result && msg.result.configuration) {
-                    // Step 2: ICE設定を使ってPeerConnection作成
-                    const config = msg.result.configuration;
-                    log('ICE config: ' + JSON.stringify(config.iceServers));
-                    await startWebRTC(entityId, config);
-                }
-
-                // WebRTC events (subscribeMessage style)
-                if (msg.type === 'event') {
-                    const evt = msg.event;
-                    if (evt.type === 'session') {
-                        sessionId = evt.session_id;
-                        log('Session: ' + sessionId);
-                    }
-                    if (evt.type === 'answer') {
-                        log('SDP answer (' + evt.answer.length + ' chars)');
-                        await pc.setRemoteDescription({ type: 'answer', sdp: evt.answer });
-                    }
-                    if (evt.type === 'candidate') {
-                        const c = evt.candidate;
-                        try {
-                            await pc.addIceCandidate({
-                                candidate: c.candidate,
-                                sdpMid: c.sdpMid || c.sdp_mid || '0',
-                                sdpMLineIndex: c.sdpMLineIndex || c.sdp_m_line_index || 0
-                            });
-                            log('Remote ICE added');
-                        } catch (e) {
-                            log('ICE error: ' + e.message);
-                        }
-                    }
-                    if (evt.type === 'error') {
-                        log('Error: ' + evt.message);
-                    }
-                }
-            };
+            if (Hls.isSupported()) {
+                hls = new Hls({ liveSyncDuration: 1, liveMaxLatencyDuration: 5 });
+                hls.loadSource(url);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                    document.getElementById('status').textContent = '再生中';
+                    video.play();
+                });
+                hls.on(Hls.Events.ERROR, (e, data) => {
+                    document.getElementById('status').textContent = 'エラー: ' + data.details;
+                });
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                video.src = url;
+                video.addEventListener('loadedmetadata', () => {
+                    document.getElementById('status').textContent = '再生中';
+                    video.play();
+                });
+            }
         }
 
-        async function startWebRTC(entityId, config) {
-            pc = new RTCPeerConnection(config);
-
-            pc.ontrack = (event) => {
-                log('Track: ' + event.track.kind);
-                document.getElementById('video').srcObject = event.streams[0];
-                document.getElementById('status').textContent = '映像受信中';
-            };
-
-            pc.onicecandidate = (event) => {
-                if (event.candidate && sessionId) {
-                    ws.send(JSON.stringify({
-                        id: msgId++,
-                        type: 'camera/webrtc/candidate',
-                        entity_id: entityId,
-                        session_id: sessionId,
-                        candidate: {
-                            candidate: event.candidate.candidate,
-                            sdpMid: event.candidate.sdpMid,
-                            sdpMLineIndex: event.candidate.sdpMLineIndex
-                        }
-                    }));
-                }
-            };
-
-            pc.oniceconnectionstatechange = () => {
-                log('ICE: ' + pc.iceConnectionState);
-                document.getElementById('status').textContent = 'ICE: ' + pc.iceConnectionState;
-            };
-
-            pc.addTransceiver('video', { direction: 'recvonly' });
-            pc.addTransceiver('audio', { direction: 'recvonly' });
-
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-
-            // subscribeMessage style: offerを送信し、eventでanswer/candidateを受信
-            const offerId = msgId++;
-            ws.send(JSON.stringify({
-                id: offerId,
-                type: 'camera/webrtc/offer',
-                entity_id: entityId,
-                offer: offer.sdp
-            }));
-            log('Offer sent (' + offer.sdp.length + ' chars)');
-        }
-
-        function stopViewing() {
-            if (pc) { pc.close(); pc = null; }
-            if (ws) { ws.close(); ws = null; }
-            document.getElementById('video').srcObject = null;
+        function stopPlay() {
+            if (hls) { hls.destroy(); hls = null; }
+            document.getElementById('video').src = '';
             document.getElementById('status').textContent = '停止';
-            log('Stopped');
         }
     </script>
 </body>
