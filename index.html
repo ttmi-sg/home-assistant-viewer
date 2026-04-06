@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HA Snapshot Viewer</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        body { font-family: sans-serif; margin: 10px; background: #1a1a1a; color: #fff; text-align: center; }
+        img { max-width: 100%; border: 1px solid #333; }
+        button { padding: 15px 30px; margin: 10px; font-size: 18px; cursor: pointer; }
+        #status { margin: 10px; font-size: 14px; color: #aaa; }
+        #log { background: #111; padding: 10px; margin-top: 10px; font-family: monospace; font-size: 11px; max-height: 200px; overflow-y: auto; white-space: pre-wrap; text-align: left; }
+    </style>
+</head>
+<body>
+    <h2>HA Camera Snapshot</h2>
+    <p>MQTT (test.mosquitto.org) 経由でスナップショットを受信</p>
+
+    <button onclick="startListening()">受信開始</button>
+    <button onclick="stopListening()">停止</button>
+
+    <div id="status">未接続</div>
+    <img id="snapshot" src="" alt="waiting for snapshot...">
+    <div id="log"></div>
+
+    <script>
+        let mqttClient = null;
+
+        function log(msg) {
+            const el = document.getElementById('log');
+            el.textContent += new Date().toLocaleTimeString() + ' ' + msg + '\n';
+            el.scrollTop = el.scrollHeight;
+        }
+
+        function startListening() {
+            document.getElementById('status').textContent = '接続中...';
+            log('Connecting to test.mosquitto.org via WebSocket...');
+
+            mqttClient = mqtt.connect('wss://test.mosquitto.org:8081');
+
+            mqttClient.on('connect', () => {
+                log('Connected to public MQTT broker');
+                document.getElementById('status').textContent = '接続済み - スナップショット待機中';
+                mqttClient.subscribe('ha-test/ha/camera/snapshot');
+                log('Subscribed to ha-test/ha/camera/snapshot');
+            });
+
+            mqttClient.on('message', (topic, message) => {
+                try {
+                    const payload = JSON.parse(message.toString());
+                    const img = document.getElementById('snapshot');
+                    img.src = 'data:' + payload.content_type + ';base64,' + payload.image_base64;
+                    document.getElementById('status').textContent =
+                        'Frame ' + payload.frame + '/' + payload.total + ' received';
+                    log('Frame ' + payload.frame + '/' + payload.total +
+                        ' (' + Math.round(payload.image_base64.length * 3/4 / 1024) + ' KB)');
+                } catch (e) {
+                    log('Error: ' + e.message);
+                }
+            });
+
+            mqttClient.on('error', (err) => {
+                log('MQTT error: ' + err.message);
+                document.getElementById('status').textContent = 'エラー: ' + err.message;
+            });
+
+            mqttClient.on('close', () => {
+                log('MQTT disconnected');
+                document.getElementById('status').textContent = '切断';
+            });
+        }
+
+        function stopListening() {
+            if (mqttClient) {
+                mqttClient.end();
+                mqttClient = null;
+            }
+            document.getElementById('status').textContent = '停止';
+            log('Stopped');
+        }
+    </script>
+</body>
+</html>
